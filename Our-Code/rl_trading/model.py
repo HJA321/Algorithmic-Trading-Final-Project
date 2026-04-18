@@ -28,8 +28,10 @@ class MultiInputLOBExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim=output_dim)
         self.encoder = AttnLOBEncoder(time_window=time_window, embedding_dim=64)
         if encoder_path:
-            state_dict = torch.load(Path(encoder_path), map_location="cpu")
-            self.encoder.load_state_dict(state_dict, strict=True)
+            checkpoint_path = Path(encoder_path)
+            if checkpoint_path.exists():
+                state_dict = torch.load(checkpoint_path, map_location="cpu")
+                self.encoder.load_state_dict(state_dict, strict=True)
         if freeze_encoder:
             for parameter in self.encoder.parameters():
                 parameter.requires_grad = False
