@@ -35,3 +35,22 @@ This folder contains the code extracted from the local reproduction project for:
 - `gymnasium`
 - `stable-baselines3`
 
+### Quick start
+
+From this folder, you can download the public LOBSTER samples with:
+
+```bash
+python run_lobster_data.py download-data
+```
+
+To prepare the downloaded raw files into processed event-level datasets:
+
+```bash
+python run_lobster_data.py prepare-data
+```
+
+You can also restrict to selected tickers, for example:
+
+```bash
+python run_lobster_data.py download-data --tickers AAPL MSFT
+```
