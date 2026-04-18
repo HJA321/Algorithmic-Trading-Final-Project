@@ -41,8 +41,9 @@ class LobWindowDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         ticker, row_index = self.samples[index]
-        start = row_index - self.time_window
-        window = self.feature_arrays[ticker][start:row_index]
+        end = row_index + 1
+        start = end - self.time_window
+        window = self.feature_arrays[ticker][start:end]
         feature = torch.from_numpy(window.copy()).unsqueeze(0)
         label = torch.tensor(self.label_arrays[ticker][row_index], dtype=torch.long)
         return feature, label
@@ -136,6 +137,26 @@ def _compute_labels(mid_price: np.ndarray, horizon_k: int, threshold: float = 1e
     return labels
 
 
+def _apply_author_lob_normalization(frame: pd.DataFrame, levels: int) -> pd.DataFrame:
+    mid_price = frame["mid_price"].to_numpy(dtype=np.float64)
+
+    for level in range(1, levels + 1):
+        ask_price_col = f"ask_price_{level}"
+        bid_price_col = f"bid_price_{level}"
+        ask_size_col = f"ask_size_{level}"
+        bid_size_col = f"bid_size_{level}"
+
+        frame[ask_price_col] = frame[ask_price_col] / np.clip(mid_price, 1e-7, None) - 1.0
+        frame[bid_price_col] = frame[bid_price_col] / np.clip(mid_price, 1e-7, None) - 1.0
+
+        ask_size_max = max(float(frame[ask_size_col].max()), 1.0)
+        bid_size_max = max(float(frame[bid_size_col].max()), 1.0)
+        frame[ask_size_col] = frame[ask_size_col] / ask_size_max
+        frame[bid_size_col] = frame[bid_size_col] / bid_size_max
+
+    return frame
+
+
 def load_lobster_frame(
     ticker: str,
     trading_date: str,
@@ -143,7 +164,7 @@ def load_lobster_frame(
     levels: int = 10,
     price_scale: float = 10_000.0,
     tick_size: float = 0.01,
-    horizon: int = 10,
+    horizon: int = 20,
     label_threshold: float = 1e-5,
     split_train: float = 0.6,
     split_val: float = 0.2,
@@ -209,46 +230,16 @@ def load_lobster_frame(
     frame["time_hours"] = frame["time"] / 3600.0
     frame["ticker"] = ticker
     frame["trading_date"] = trading_date
+    frame = _apply_author_lob_normalization(frame, levels=levels)
     return frame
 
 
 def normalize_lob_window(window: np.ndarray) -> np.ndarray:
-    normalized = np.asarray(window, dtype=np.float32).copy()
-    ask1 = normalized[:, 0]
-    bid1 = normalized[:, 2]
-    mid = ((ask1 + bid1) / 2.0).reshape(-1, 1)
-
-    price_indices = [index for index in range(normalized.shape[1]) if index % 4 in (0, 2)]
-    size_indices = [index for index in range(normalized.shape[1]) if index % 4 in (1, 3)]
-
-    normalized[:, price_indices] = (normalized[:, price_indices] - mid) / np.clip(mid, 1e-6, None)
-    price_mean = normalized[:, price_indices].mean(axis=0, keepdims=True)
-    price_std = normalized[:, price_indices].std(axis=0, keepdims=True)
-    normalized[:, price_indices] = (normalized[:, price_indices] - price_mean) / np.clip(price_std, 1e-6, None)
-
-    max_volume = np.max(np.abs(normalized[:, size_indices]), axis=0, keepdims=True)
-    normalized[:, size_indices] = normalized[:, size_indices] / np.clip(max_volume, 1.0, None)
-    return normalized.astype(np.float32)
+    return np.asarray(window, dtype=np.float32).copy()
 
 
 def normalize_lob_batch(batch: torch.Tensor) -> torch.Tensor:
-    normalized = batch.to(dtype=torch.float32).clone()
-    feature_count = normalized.shape[-1]
-    price_indices = [index for index in range(feature_count) if index % 4 in (0, 2)]
-    size_indices = [index for index in range(feature_count) if index % 4 in (1, 3)]
-
-    mid = ((normalized[..., 0:1] + normalized[..., 2:3]) / 2.0).clamp_min(1e-6)
-
-    price_features = normalized[..., price_indices]
-    price_features = (price_features - mid) / mid
-    price_mean = price_features.mean(dim=-2, keepdim=True)
-    price_std = price_features.std(dim=-2, unbiased=False, keepdim=True)
-    normalized[..., price_indices] = (price_features - price_mean) / price_std.clamp_min(1e-6)
-
-    size_features = normalized[..., size_indices]
-    max_volume = size_features.abs().amax(dim=-2, keepdim=True)
-    normalized[..., size_indices] = size_features / max_volume.clamp_min(1.0)
-    return normalized
+    return batch.to(dtype=torch.float32)
 
 
 def _collect_split_samples(frame: pd.DataFrame, ticker: str, split: str, time_window: int) -> list[tuple[str, int]]:
@@ -256,7 +247,7 @@ def _collect_split_samples(frame: pd.DataFrame, ticker: str, split: str, time_wi
     valid_indices = frame.index[
         (frame["split_id"] == split_id)
         & (frame["label"] >= 0)
-        & (frame.index >= time_window)
+        & (frame.index >= time_window - 1)
         & (frame["event_type"] != 7)
     ]
     return [(ticker, int(index)) for index in valid_indices]
@@ -267,7 +258,7 @@ def load_and_process_day(
     trading_date: str,
     data_root: str | Path,
     levels: int = 10,
-    horizon: int = 10,
+    horizon: int = 20,
     time_window: int = 50,
     price_scale: float = 10_000.0,
     tick_size: float = 0.01,
@@ -308,7 +299,7 @@ def create_datasets(
     trading_date: str,
     data_root: str | Path,
     levels: int = 10,
-    horizon: int = 10,
+    horizon: int = 20,
     time_window: int = 50,
     price_scale: float = 10_000.0,
     tick_size: float = 0.01,

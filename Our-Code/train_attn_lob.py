@@ -4,6 +4,7 @@ import argparse
 import os
 import json
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,6 +20,9 @@ from attn_lob_pytorch.data import DEFAULT_TICKERS, DEFAULT_TRADING_DATE, create_
 from attn_lob_pytorch.model import AttnLOBClassifier
 
 
+CLASS_NAMES = ("down", "stationary", "up")
+
+
 @dataclass
 class TrainConfig:
     tickers: str = ",".join(DEFAULT_TICKERS)
@@ -26,7 +30,7 @@ class TrainConfig:
     data_root: str = "../lobster_attnlob_us_repro/data/lobster_raw"
     output_dir: str = "checkpoints/attn_lob"
     levels: int = 10
-    horizon: int = 10
+    horizon: int = 20
     label_threshold: float = 1e-5
     time_window: int = 50
     split_train: float = 0.6
@@ -34,7 +38,7 @@ class TrainConfig:
     price_scale: float = 10000.0
     tick_size: float = 0.01
     batch_size: int = 64
-    epochs: int = 20
+    epochs: int = 100
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     num_workers: int = -1
@@ -46,29 +50,30 @@ class TrainConfig:
 
 
 def parse_args() -> TrainConfig:
+    defaults = TrainConfig()
     parser = argparse.ArgumentParser(description="Pre-train the Attn-LOB encoder in PyTorch.")
-    parser.add_argument("--tickers", default=",".join(DEFAULT_TICKERS))
-    parser.add_argument("--trading-date", default=DEFAULT_TRADING_DATE)
-    parser.add_argument("--data-root", default="../lobster_attnlob_us_repro/data/lobster_raw")
-    parser.add_argument("--output-dir", default="checkpoints/attn_lob")
-    parser.add_argument("--levels", type=int, default=10)
-    parser.add_argument("--horizon", type=int, default=10)
-    parser.add_argument("--label-threshold", type=float, default=1e-5)
-    parser.add_argument("--time-window", type=int, default=50)
-    parser.add_argument("--split-train", type=float, default=0.6)
-    parser.add_argument("--split-val", type=float, default=0.2)
-    parser.add_argument("--price-scale", type=float, default=10000.0)
-    parser.add_argument("--tick-size", type=float, default=0.01)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--num-workers", type=int, default=-1)
-    parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
-    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--tickers", default=defaults.tickers)
+    parser.add_argument("--trading-date", default=defaults.trading_date)
+    parser.add_argument("--data-root", default=defaults.data_root)
+    parser.add_argument("--output-dir", default=defaults.output_dir)
+    parser.add_argument("--levels", type=int, default=defaults.levels)
+    parser.add_argument("--horizon", type=int, default=defaults.horizon)
+    parser.add_argument("--label-threshold", type=float, default=defaults.label_threshold)
+    parser.add_argument("--time-window", type=int, default=defaults.time_window)
+    parser.add_argument("--split-train", type=float, default=defaults.split_train)
+    parser.add_argument("--split-val", type=float, default=defaults.split_val)
+    parser.add_argument("--price-scale", type=float, default=defaults.price_scale)
+    parser.add_argument("--tick-size", type=float, default=defaults.tick_size)
+    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
+    parser.add_argument("--epochs", type=int, default=defaults.epochs)
+    parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
+    parser.add_argument("--weight-decay", type=float, default=defaults.weight_decay)
+    parser.add_argument("--num-workers", type=int, default=defaults.num_workers)
+    parser.add_argument("--prefetch-factor", type=int, default=defaults.prefetch_factor)
+    parser.add_argument("--seed", type=int, default=defaults.seed)
+    parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default=defaults.precision)
+    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=defaults.channels_last)
     args = parser.parse_args()
     return TrainConfig(**vars(args))
 
@@ -111,12 +116,66 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, flo
     macro_recall = recall.mean()
     macro_f1 = f1.mean()
 
-    return {
+    metrics = {
         "accuracy": accuracy.item(),
         "precision": macro_precision.item(),
         "recall": macro_recall.item(),
         "f1": macro_f1.item(),
     }
+    for class_id, class_name in enumerate(CLASS_NAMES[:num_classes]):
+        metrics[f"precision_{class_name}"] = precision[class_id].item()
+        metrics[f"recall_{class_name}"] = recall[class_id].item()
+        metrics[f"f1_{class_name}"] = f1[class_id].item()
+    return metrics
+
+
+def summarize_dataset_split(dataset, num_classes: int) -> dict[str, object]:
+    counts = np.zeros(num_classes, dtype=np.int64)
+    for ticker, row_index in dataset.samples:
+        label = int(dataset.label_arrays[ticker][row_index])
+        if 0 <= label < num_classes:
+            counts[label] += 1
+    total = int(counts.sum())
+    percentages = counts / max(total, 1)
+    return {
+        "samples": total,
+        "counts": counts.tolist(),
+        "percentages": percentages.tolist(),
+    }
+
+
+def format_split_summary(name: str, summary: dict[str, object]) -> str:
+    counts = summary["counts"]
+    percentages = summary["percentages"]
+    class_parts = [
+        f"class_{class_id}={count} ({percentage:.1%})"
+        for class_id, (count, percentage) in enumerate(zip(counts, percentages, strict=False))
+    ]
+    return f"{name}: samples={summary['samples']} " + " ".join(class_parts)
+
+
+def format_metrics(prefix: str, metrics: dict[str, float]) -> str:
+    return (
+        f"{prefix}_loss={metrics['loss']:.4f} "
+        f"{prefix}_accuracy={metrics['accuracy']:.4f} "
+        f"{prefix}_precision={metrics['precision']:.4f} "
+        f"{prefix}_recall={metrics['recall']:.4f} "
+        f"{prefix}_f1={metrics['f1']:.4f}"
+    )
+
+
+def format_class_metrics(prefix: str, metrics: dict[str, float]) -> str:
+    class_parts = []
+    for class_name in CLASS_NAMES:
+        precision_key = f"precision_{class_name}"
+        recall_key = f"recall_{class_name}"
+        f1_key = f"f1_{class_name}"
+        if precision_key not in metrics:
+            continue
+        class_parts.append(
+            f"{class_name}(p={metrics[precision_key]:.4f},r={metrics[recall_key]:.4f},f1={metrics[f1_key]:.4f})"
+        )
+    return f"{prefix}_per_class " + " ".join(class_parts)
 
 
 def configure_torch_runtime(device: torch.device) -> None:
@@ -281,45 +340,73 @@ def main() -> None:
         **loader_kwargs,
     )
 
+    output_dir = Path(config.output_dir) / experiment_name(tickers, config.trading_date)
+
     print(
         f"device={device} precision={autocast_dtype or torch.float32} "
-        f"num_workers={num_workers} channels_last={config.channels_last}"
+        f"num_workers={num_workers} channels_last={config.channels_last} "
+        f"batch_size={config.batch_size} learning_rate={config.learning_rate} horizon={config.horizon}"
+    )
+    print(f"output_dir={output_dir}")
+    print(
+        format_split_summary("train", summarize_dataset_split(datasets.train, datasets.num_classes))
+    )
+    print(
+        format_split_summary("val", summarize_dataset_split(datasets.val, datasets.num_classes))
+    )
+    print(
+        format_split_summary("test", summarize_dataset_split(datasets.test, datasets.num_classes))
+    )
+    print(
+        f"dataloader: train_batches={len(train_loader)} val_batches={len(val_loader)} test_batches={len(test_loader)}"
     )
 
     best_val_f1 = float("-inf")
     best_metrics: dict[str, float] = {}
-    output_dir = Path(config.output_dir) / experiment_name(tickers, config.trading_date)
 
     for epoch in range(1, config.epochs + 1):
+        epoch_start = time.perf_counter()
         train_metrics = run_epoch(model, train_loader, criterion, device, optimizer, autocast_dtype, config.channels_last)
         val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None, autocast_dtype=autocast_dtype, channels_last=config.channels_last)
+        epoch_seconds = time.perf_counter() - epoch_start
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        improved = val_metrics["f1"] > best_val_f1
 
         print(
-            f"epoch={epoch} "
+            f"epoch={epoch}/{config.epochs} lr={current_lr:.6g} time={epoch_seconds:.1f}s "
             f"train_loss={train_metrics['loss']:.4f} train_f1={train_metrics['f1']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} val_f1={val_metrics['f1']:.4f}"
+            f"val_loss={val_metrics['loss']:.4f} val_f1={val_metrics['f1']:.4f} "
+            f"best_val_f1={max(best_val_f1, val_metrics['f1']):.4f} improved={improved}"
         )
 
-        if val_metrics["f1"] > best_val_f1:
+        if improved:
             best_val_f1 = val_metrics["f1"]
             best_metrics = {"epoch": epoch, **val_metrics}
             save_checkpoint(output_dir, model, config, datasets.metadata, datasets.feature_columns, best_metrics)
+            print(
+                f"saved_best_checkpoint epoch={epoch} val_f1={val_metrics['f1']:.4f} "
+                f"model={output_dir / 'best_model.pt'} encoder={output_dir / 'best_encoder.pt'}"
+            )
 
     model.load_state_dict(torch.load(output_dir / "best_model.pt", map_location=device))
     test_metrics = run_epoch(model, test_loader, criterion, device, optimizer=None, autocast_dtype=autocast_dtype, channels_last=config.channels_last)
+    if best_metrics:
+        print(
+            f"best_validation epoch={best_metrics['epoch']} "
+            f"{format_metrics('best_val', best_metrics)}"
+        )
+        print(format_class_metrics("best_val", best_metrics))
     print(
-        "test_metrics "
-        f"loss={test_metrics['loss']:.4f} "
-        f"accuracy={test_metrics['accuracy']:.4f} "
-        f"precision={test_metrics['precision']:.4f} "
-        f"recall={test_metrics['recall']:.4f} "
-        f"f1={test_metrics['f1']:.4f}"
+        f"test_summary {format_metrics('test', test_metrics)} checkpoint={output_dir / 'best_model.pt'}"
     )
+    print(format_class_metrics("test", test_metrics))
 
     metadata_path = output_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["test_metrics"] = test_metrics
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"metadata_written path={metadata_path}")
 
 
 if __name__ == "__main__":
