@@ -1,0 +1,12 @@
+# Python 3.10+ recommended.
+# Use an isolated virtual environment when possible.
+# For GPU training, install a CUDA-compatible PyTorch wheel from https://pytorch.org/get-started/locally/
+
+# NumPy 2.x is not compatible with the system PyTorch/SciPy stack currently present
+# in this repo's target environment, so keep NumPy on the latest 1.24 line.
+numpy>=1.24,<1.25
+pandas>=2.0,<3
+scipy>=1.10,<1.13
+networkx>=3.2,<4
+torch>=2.2,<3
+tqdm>=4.66,<5

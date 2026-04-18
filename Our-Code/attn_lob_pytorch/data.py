@@ -27,17 +27,24 @@ class LobWindowDataset(Dataset):
         self.samples = samples
         self.feature_columns = list(feature_columns)
         self.time_window = time_window
+        self.feature_arrays = {
+            ticker: frame.loc[:, self.feature_columns].to_numpy(dtype=np.float32, copy=True)
+            for ticker, frame in frames.items()
+        }
+        self.label_arrays = {
+            ticker: frame["label"].to_numpy(dtype=np.int64, copy=True)
+            for ticker, frame in frames.items()
+        }
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         ticker, row_index = self.samples[index]
-        frame = self.frames[ticker]
         start = row_index - self.time_window
-        window = frame.iloc[start:row_index][self.feature_columns].to_numpy(dtype=np.float32)
-        feature = torch.from_numpy(normalize_lob_window(window)).unsqueeze(0).float()
-        label = torch.tensor(int(frame.iloc[row_index]["label"]), dtype=torch.long)
+        window = self.feature_arrays[ticker][start:row_index]
+        feature = torch.from_numpy(window.copy()).unsqueeze(0)
+        label = torch.tensor(self.label_arrays[ticker][row_index], dtype=torch.long)
         return feature, label
 
 
@@ -222,6 +229,26 @@ def normalize_lob_window(window: np.ndarray) -> np.ndarray:
     max_volume = np.max(np.abs(normalized[:, size_indices]), axis=0, keepdims=True)
     normalized[:, size_indices] = normalized[:, size_indices] / np.clip(max_volume, 1.0, None)
     return normalized.astype(np.float32)
+
+
+def normalize_lob_batch(batch: torch.Tensor) -> torch.Tensor:
+    normalized = batch.to(dtype=torch.float32).clone()
+    feature_count = normalized.shape[-1]
+    price_indices = [index for index in range(feature_count) if index % 4 in (0, 2)]
+    size_indices = [index for index in range(feature_count) if index % 4 in (1, 3)]
+
+    mid = ((normalized[..., 0:1] + normalized[..., 2:3]) / 2.0).clamp_min(1e-6)
+
+    price_features = normalized[..., price_indices]
+    price_features = (price_features - mid) / mid
+    price_mean = price_features.mean(dim=-2, keepdim=True)
+    price_std = price_features.std(dim=-2, unbiased=False, keepdim=True)
+    normalized[..., price_indices] = (price_features - price_mean) / price_std.clamp_min(1e-6)
+
+    size_features = normalized[..., size_indices]
+    max_volume = size_features.abs().amax(dim=-2, keepdim=True)
+    normalized[..., size_indices] = size_features / max_volume.clamp_min(1.0)
+    return normalized
 
 
 def _collect_split_samples(frame: pd.DataFrame, ticker: str, split: str, time_window: int) -> list[tuple[str, int]]:

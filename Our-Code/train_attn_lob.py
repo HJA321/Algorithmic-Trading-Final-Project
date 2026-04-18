@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import random
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -13,7 +15,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from attn_lob_pytorch.data import DEFAULT_TICKERS, DEFAULT_TRADING_DATE, create_datasets
+from attn_lob_pytorch.data import DEFAULT_TICKERS, DEFAULT_TRADING_DATE, create_datasets, normalize_lob_batch
 from attn_lob_pytorch.model import AttnLOBClassifier
 
 
@@ -35,9 +37,12 @@ class TrainConfig:
     epochs: int = 20
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    num_workers: int = 0
+    num_workers: int = -1
+    prefetch_factor: int = 4
     seed: int = 42
     device: str = "cpu"
+    precision: str = "auto"
+    channels_last: bool = True
 
 
 def parse_args() -> TrainConfig:
@@ -58,9 +63,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=-1)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
+    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     return TrainConfig(**vars(args))
 
@@ -111,12 +119,44 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, flo
     }
 
 
+def configure_torch_runtime(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+
+def resolve_num_workers(config: TrainConfig) -> int:
+    if config.num_workers >= 0:
+        return config.num_workers
+    cpu_count = os.cpu_count() or 1
+    return min(8, max(2, cpu_count // 2))
+
+
+def resolve_autocast_dtype(config: TrainConfig, device: torch.device) -> torch.dtype | None:
+    if device.type != "cuda":
+        return None
+    if config.precision == "fp32":
+        return None
+    if config.precision == "bf16":
+        return torch.bfloat16
+    if config.precision == "fp16":
+        return torch.float16
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 def run_epoch(
     model: AttnLOBClassifier,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    autocast_dtype: torch.dtype | None,
+    channels_last: bool,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -127,15 +167,26 @@ def run_epoch(
     all_labels: list[torch.Tensor] = []
 
     progress = tqdm(loader, leave=False)
-    for features, labels in progress:
-        features = features.to(device)
-        labels = labels.to(device)
+    autocast_context = (
+        torch.autocast(device_type=device.type, dtype=autocast_dtype)
+        if autocast_dtype is not None
+        else nullcontext()
+    )
+
+    for step, (features, labels) in enumerate(progress, start=1):
+        features = features.to(device, non_blocking=device.type == "cuda")
+        labels = labels.to(device, non_blocking=device.type == "cuda")
+        features = normalize_lob_batch(features)
+        if channels_last and device.type == "cuda":
+            features = features.contiguous(memory_format=torch.channels_last)
 
         with torch.set_grad_enabled(is_train):
-            logits = model(features)
-            loss = criterion(logits, labels)
             if is_train:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
+            with autocast_context:
+                logits = model(features)
+                loss = criterion(logits, labels)
+            if is_train:
                 loss.backward()
                 optimizer.step()
 
@@ -144,7 +195,8 @@ def run_epoch(
         total_samples += batch_size
         all_logits.append(logits.detach().cpu())
         all_labels.append(labels.detach().cpu())
-        progress.set_postfix(loss=f"{loss.item():.4f}")
+        if step == 1 or step % 50 == 0:
+            progress.set_postfix(loss=f"{loss.item():.4f}")
 
     metrics = compute_metrics(torch.cat(all_logits, dim=0), torch.cat(all_labels, dim=0))
     metrics["loss"] = total_loss / max(total_samples, 1)
@@ -176,6 +228,9 @@ def main() -> None:
     config = parse_args()
     set_seed(config.seed)
 
+    device = torch.device(config.device)
+    configure_torch_runtime(device)
+
     tickers = parse_day_list(config.tickers)
     datasets = create_datasets(
         tickers=tickers,
@@ -191,31 +246,44 @@ def main() -> None:
         split_val=config.split_val,
     )
 
-    device = torch.device(config.device)
+    autocast_dtype = resolve_autocast_dtype(config, device)
+    num_workers = resolve_num_workers(config)
+
     model = AttnLOBClassifier(time_window=config.time_window, num_classes=datasets.num_classes).to(device)
+    if config.channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
 
+    loader_kwargs = {
+        "batch_size": config.batch_size,
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = config.prefetch_factor
+
     train_loader = DataLoader(
         datasets.train,
-        batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         datasets.val,
-        batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         datasets.test,
-        batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
+        **loader_kwargs,
+    )
+
+    print(
+        f"device={device} precision={autocast_dtype or torch.float32} "
+        f"num_workers={num_workers} channels_last={config.channels_last}"
     )
 
     best_val_f1 = float("-inf")
@@ -223,8 +291,8 @@ def main() -> None:
     output_dir = Path(config.output_dir) / experiment_name(tickers, config.trading_date)
 
     for epoch in range(1, config.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
-        val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None)
+        train_metrics = run_epoch(model, train_loader, criterion, device, optimizer, autocast_dtype, config.channels_last)
+        val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None, autocast_dtype=autocast_dtype, channels_last=config.channels_last)
 
         print(
             f"epoch={epoch} "
@@ -238,7 +306,7 @@ def main() -> None:
             save_checkpoint(output_dir, model, config, datasets.metadata, datasets.feature_columns, best_metrics)
 
     model.load_state_dict(torch.load(output_dir / "best_model.pt", map_location=device))
-    test_metrics = run_epoch(model, test_loader, criterion, device, optimizer=None)
+    test_metrics = run_epoch(model, test_loader, criterion, device, optimizer=None, autocast_dtype=autocast_dtype, channels_last=config.channels_last)
     print(
         "test_metrics "
         f"loss={test_metrics['loss']:.4f} "
