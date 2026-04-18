@@ -1,0 +1,8 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+lobster_attnlob_us_repro/data/
+Our-Code/checkpoints/

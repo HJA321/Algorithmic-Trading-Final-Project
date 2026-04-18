@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import math
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+class Conv2dSame(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple[int, int], stride: tuple[int, int] = (1, 1)):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        input_height, input_width = inputs.shape[-2:]
+        stride_height, stride_width = self.stride
+        kernel_height, kernel_width = self.kernel_size
+
+        out_height = math.ceil(input_height / stride_height)
+        out_width = math.ceil(input_width / stride_width)
+
+        pad_height = max((out_height - 1) * stride_height + kernel_height - input_height, 0)
+        pad_width = max((out_width - 1) * stride_width + kernel_width - input_width, 0)
+
+        if pad_height or pad_width:
+            inputs = F.pad(
+                inputs,
+                [pad_width // 2, pad_width - pad_width // 2, pad_height // 2, pad_height - pad_height // 2],
+            )
+        return self.conv(inputs)
+
+
+class MaxPool2dSame(nn.Module):
+    def __init__(self, kernel_size: tuple[int, int], stride: tuple[int, int]):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.pool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        input_height, input_width = inputs.shape[-2:]
+        stride_height, stride_width = self.stride
+        kernel_height, kernel_width = self.kernel_size
+
+        out_height = math.ceil(input_height / stride_height)
+        out_width = math.ceil(input_width / stride_width)
+
+        pad_height = max((out_height - 1) * stride_height + kernel_height - input_height, 0)
+        pad_width = max((out_width - 1) * stride_width + kernel_width - input_width, 0)
+
+        if pad_height or pad_width:
+            inputs = F.pad(
+                inputs,
+                [pad_width // 2, pad_width - pad_width // 2, pad_height // 2, pad_height - pad_height // 2],
+                value=float("-inf"),
+            )
+        return self.pool(inputs)
+
+
+class AttnLOBEncoder(nn.Module):
+    def __init__(self, time_window: int = 50, embedding_dim: int = 64, num_heads: int = 10, head_dim: int = 16):
+        super().__init__()
+        self.time_window = time_window
+        self.embedding_dim = embedding_dim
+        attn_dim = num_heads * head_dim
+
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(1, 2), stride=(1, 2)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Conv2d(32, 32, kernel_size=(1, 5), stride=(1, 5)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Conv2d(32, 32, kernel_size=(1, 4)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+        )
+
+        self.inception_branch_1 = nn.Sequential(
+            Conv2dSame(32, 64, kernel_size=(1, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(64, 64, kernel_size=(3, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+        )
+        self.inception_branch_2 = nn.Sequential(
+            Conv2dSame(32, 64, kernel_size=(1, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+            Conv2dSame(64, 64, kernel_size=(5, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+        )
+        self.inception_branch_3 = nn.Sequential(
+            MaxPool2dSame(kernel_size=(3, 1), stride=(1, 1)),
+            Conv2dSame(32, 64, kernel_size=(1, 1)),
+            nn.LeakyReLU(negative_slope=0.01),
+        )
+
+        self.query_projection = nn.Linear(192, attn_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=attn_dim,
+            num_heads=num_heads,
+            kdim=192,
+            vdim=192,
+            batch_first=True,
+        )
+        self.output_projection = nn.Linear(attn_dim, embedding_dim)
+
+    def forward(self, inputs: torch.Tensor, return_attention: bool = False):
+        features = self.feature_extractor(inputs)
+
+        branch_1 = self.inception_branch_1(features)
+        branch_2 = self.inception_branch_2(features)
+        branch_3 = self.inception_branch_3(features)
+        features = torch.cat([branch_1, branch_2, branch_3], dim=1)
+
+        sequence = features.squeeze(-1).transpose(1, 2)
+        query = self.query_projection(sequence[:, -1:, :])
+        attention_output, attention_weights = self.attention(query=query, key=sequence, value=sequence, need_weights=return_attention)
+        embedding = self.output_projection(attention_output).flatten(start_dim=1)
+
+        if return_attention:
+            return embedding, attention_weights
+        return embedding
+
+
+class AttnLOBClassifier(nn.Module):
+    def __init__(self, time_window: int = 50, embedding_dim: int = 64, num_classes: int = 3):
+        super().__init__()
+        self.encoder = AttnLOBEncoder(time_window=time_window, embedding_dim=embedding_dim)
+        self.classifier = nn.Linear(embedding_dim, num_classes)
+
+    def forward(self, inputs: torch.Tensor, return_attention: bool = False):
+        if return_attention:
+            embedding, attention_weights = self.encoder(inputs, return_attention=True)
+            logits = self.classifier(embedding)
+            return logits, attention_weights
+        embedding = self.encoder(inputs)
+        return self.classifier(embedding)
