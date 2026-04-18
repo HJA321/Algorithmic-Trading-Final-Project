@@ -99,28 +99,33 @@ def _sanitize_book(frame: pd.DataFrame, levels: int, tick_size: float) -> pd.Dat
     return frame
 
 
-def _compute_alpha(mid_price: np.ndarray, train_end: int, tick_size: float) -> float:
-    train_mid = mid_price[:train_end]
-    valid = train_mid[np.isfinite(train_mid) & (train_mid > 0)]
-    if valid.size == 0:
-        return tick_size
-    return float(np.median(tick_size / valid))
+def _compute_labels(mid_price: np.ndarray, horizon_k: int, threshold: float = 1e-5) -> np.ndarray:
+    """Reproduce the original paper code's mid-price direction labels.
 
+    The original implementation computes:
+    - a trailing rolling mean over the previous ``horizon_k`` mid-prices;
+    - a future mean by shifting that rolling mean forward by ``horizon_k`` steps;
+    - the relative change between future and past means.
 
-def _compute_labels(mid_price: np.ndarray, horizon_k: int, alpha: float) -> np.ndarray:
-    labels = np.full(len(mid_price), -99, dtype=np.int64)
-    for index in range(horizon_k, len(mid_price) - horizon_k):
-        price_past = mid_price[index - horizon_k : index + 1].mean()
-        price_future = mid_price[index : index + horizon_k + 1].mean()
-        if price_past <= 0:
-            continue
-        ratio = (price_future - price_past) / price_past
-        if ratio > alpha:
-            labels[index] = 2
-        elif ratio < -alpha:
-            labels[index] = 0
-        else:
-            labels[index] = 1
+    We keep this window definition but map labels to the internal class order used in
+    this repo: 0 = down, 1 = stationary, 2 = up.
+    """
+    mid_series = pd.Series(mid_price, dtype=np.float64)
+    price_past = mid_series.rolling(window=horizon_k).mean()
+    price_future = price_past.shift(-horizon_k)
+    pct_change = (price_future - price_past) / price_past
+
+    labels = np.full(len(mid_series), -99, dtype=np.int64)
+    valid_mask = pct_change.notna().to_numpy() & np.isfinite(pct_change.to_numpy()) & (price_past.to_numpy() > 0)
+    pct_values = pct_change.to_numpy(dtype=np.float64)
+
+    up_mask = valid_mask & (pct_values >= threshold)
+    mid_mask = valid_mask & (pct_values < threshold) & (pct_values > -threshold)
+    down_mask = valid_mask & (pct_values <= -threshold)
+
+    labels[down_mask] = 0
+    labels[mid_mask] = 1
+    labels[up_mask] = 2
     return labels
 
 
@@ -132,16 +137,44 @@ def load_lobster_frame(
     price_scale: float = 10_000.0,
     tick_size: float = 0.01,
     horizon: int = 10,
+    label_threshold: float = 1e-5,
     split_train: float = 0.6,
     split_val: float = 0.2,
 ) -> pd.DataFrame:
+    """Load one LOBSTER trading day as an event-aligned frame.
+
+    Assumptions matched to the raw LOBSTER sample format:
+    - both CSV files are headerless;
+    - message rows follow: time, event_type, order_id, size, price, direction;
+    - orderbook rows follow: ask1 price, ask1 size, bid1 price, bid1 size, ask2 ...;
+    - message row k and orderbook row k describe the same event-state snapshot;
+    - message time is measured in seconds since midnight, so regular trading starts
+      around 34200 seconds (09:30:00).
+    """
     data_root = Path(data_root)
     message_path, orderbook_path = _discover_raw_files(data_root, ticker, trading_date)
-    message = pd.read_csv(message_path, header=None, names=MESSAGE_COLUMNS)
-    orderbook = pd.read_csv(orderbook_path, header=None, names=_orderbook_columns(levels))
+    message = pd.read_csv(
+        message_path,
+        header=None,
+        names=MESSAGE_COLUMNS,
+        dtype={
+            "time": np.float64,
+            "event_type": np.int64,
+            "order_id": np.int64,
+            "size": np.float64,
+            "price": np.float64,
+            "direction": np.int64,
+        },
+    )
+    orderbook_columns = _orderbook_columns(levels)
+    orderbook = pd.read_csv(orderbook_path, header=None, names=orderbook_columns, dtype=np.float64)
     if len(message) != len(orderbook):
         raise ValueError(f"LOBSTER message/orderbook row mismatch for {ticker}")
+    if not message["time"].is_monotonic_increasing:
+        raise ValueError(f"LOBSTER message timestamps are not monotonic for {ticker}")
 
+    # LOBSTER aligns message row k with orderbook row k, so we concatenate by row index
+    # rather than merging on time values.
     frame = pd.concat([message, orderbook], axis=1)
     price_columns = [column for column in frame.columns if "price" in column]
     size_columns = [column for column in frame.columns if column.endswith("size")]
@@ -155,15 +188,18 @@ def load_lobster_frame(
     frame["mid_price"] = (frame["ask_price_1"] + frame["bid_price_1"]) / 2.0
     frame["spread"] = frame["ask_price_1"] - frame["bid_price_1"]
 
-    train_end = int(len(frame) * split_train)
     val_end = int(len(frame) * (split_train + split_val))
-    alpha = _compute_alpha(frame["mid_price"].to_numpy(dtype=np.float64), train_end, tick_size)
-    frame["label"] = _compute_labels(frame["mid_price"].to_numpy(dtype=np.float64), horizon, alpha)
+    frame["label"] = _compute_labels(
+        frame["mid_price"].to_numpy(dtype=np.float64),
+        horizon,
+        threshold=label_threshold,
+    )
     frame["split_id"] = np.select(
-        [frame.index < train_end, frame.index < val_end],
+        [frame.index < int(len(frame) * split_train), frame.index < val_end],
         [SPLIT_TO_ID["train"], SPLIT_TO_ID["val"]],
         default=SPLIT_TO_ID["test"],
     ).astype(np.int8)
+    frame["time_hours"] = frame["time"] / 3600.0
     frame["ticker"] = ticker
     frame["trading_date"] = trading_date
     return frame
@@ -208,6 +244,7 @@ def load_and_process_day(
     time_window: int = 50,
     price_scale: float = 10_000.0,
     tick_size: float = 0.01,
+    label_threshold: float = 1e-5,
     split_train: float = 0.6,
     split_val: float = 0.2,
 ) -> tuple[pd.DataFrame, list[str], dict]:
@@ -219,6 +256,7 @@ def load_and_process_day(
         price_scale=price_scale,
         tick_size=tick_size,
         horizon=horizon,
+        label_threshold=label_threshold,
         split_train=split_train,
         split_val=split_val,
     )
@@ -229,6 +267,7 @@ def load_and_process_day(
         "rows": len(frame),
         "levels": levels,
         "horizon": horizon,
+        "label_threshold": label_threshold,
         "time_window": time_window,
         "split_train": split_train,
         "split_val": split_val,
@@ -246,6 +285,7 @@ def create_datasets(
     time_window: int = 50,
     price_scale: float = 10_000.0,
     tick_size: float = 0.01,
+    label_threshold: float = 1e-5,
     split_train: float = 0.6,
     split_val: float = 0.2,
 ) -> DatasetBundle:
@@ -266,6 +306,7 @@ def create_datasets(
             time_window=time_window,
             price_scale=price_scale,
             tick_size=tick_size,
+            label_threshold=label_threshold,
             split_train=split_train,
             split_val=split_val,
         )
@@ -280,6 +321,7 @@ def create_datasets(
         "trading_date": trading_date,
         "levels": levels,
         "horizon": horizon,
+        "label_threshold": label_threshold,
         "time_window": time_window,
         "split_train": split_train,
         "split_val": split_val,

@@ -25,6 +25,7 @@ class TrainConfig:
     output_dir: str = "checkpoints/attn_lob"
     levels: int = 10
     horizon: int = 10
+    label_threshold: float = 1e-5
     time_window: int = 50
     split_train: float = 0.6
     split_val: float = 0.2
@@ -47,6 +48,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--output-dir", default="checkpoints/attn_lob")
     parser.add_argument("--levels", type=int, default=10)
     parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--label-threshold", type=float, default=1e-5)
     parser.add_argument("--time-window", type=int, default=50)
     parser.add_argument("--split-train", type=float, default=0.6)
     parser.add_argument("--split-val", type=float, default=0.2)
@@ -181,6 +183,7 @@ def main() -> None:
         data_root=config.data_root,
         levels=config.levels,
         horizon=config.horizon,
+        label_threshold=config.label_threshold,
         time_window=config.time_window,
         price_scale=config.price_scale,
         tick_size=config.tick_size,
