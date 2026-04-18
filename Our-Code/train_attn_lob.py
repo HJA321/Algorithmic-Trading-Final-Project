@@ -232,8 +232,9 @@ def run_epoch(
         else nullcontext()
     )
 
-    for step, (features, labels) in enumerate(progress, start=1):
+    for step, (features, aux_features, labels) in enumerate(progress, start=1):
         features = features.to(device, non_blocking=device.type == "cuda")
+        aux_features = aux_features.to(device, non_blocking=device.type == "cuda")
         labels = labels.to(device, non_blocking=device.type == "cuda")
         features = normalize_lob_batch(features)
         if channels_last and device.type == "cuda":
@@ -243,7 +244,7 @@ def run_epoch(
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             with autocast_context:
-                logits = model(features)
+                logits = model(features, aux_features=aux_features)
                 loss = criterion(logits, labels)
             if is_train:
                 loss.backward()
@@ -268,6 +269,7 @@ def save_checkpoint(
     config: TrainConfig,
     dataset_metadata: dict,
     feature_columns: list[str],
+    aux_feature_columns: list[str],
     metrics: dict[str, float],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +279,7 @@ def save_checkpoint(
     metadata = {
         "config": asdict(config),
         "feature_columns": feature_columns,
+        "aux_feature_columns": aux_feature_columns,
         "dataset_metadata": dataset_metadata,
         "metrics": metrics,
     }
@@ -308,7 +311,11 @@ def main() -> None:
     autocast_dtype = resolve_autocast_dtype(config, device)
     num_workers = resolve_num_workers(config)
 
-    model = AttnLOBClassifier(time_window=config.time_window, num_classes=datasets.num_classes).to(device)
+    model = AttnLOBClassifier(
+        time_window=config.time_window,
+        num_classes=datasets.num_classes,
+        aux_feature_dim=len(datasets.aux_feature_columns),
+    ).to(device)
     if config.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
 
@@ -383,7 +390,15 @@ def main() -> None:
         if improved:
             best_val_f1 = val_metrics["f1"]
             best_metrics = {"epoch": epoch, **val_metrics}
-            save_checkpoint(output_dir, model, config, datasets.metadata, datasets.feature_columns, best_metrics)
+            save_checkpoint(
+                output_dir,
+                model,
+                config,
+                datasets.metadata,
+                datasets.feature_columns,
+                datasets.aux_feature_columns,
+                best_metrics,
+            )
             print(
                 f"saved_best_checkpoint epoch={epoch} val_f1={val_metrics['f1']:.4f} "
                 f"model={output_dir / 'best_model.pt'} encoder={output_dir / 'best_encoder.pt'}"

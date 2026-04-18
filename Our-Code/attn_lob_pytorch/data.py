@@ -21,14 +21,20 @@ class LobWindowDataset(Dataset):
         frames: Dict[str, pd.DataFrame],
         samples: list[tuple[str, int]],
         feature_columns: Sequence[str],
+        aux_feature_columns: Sequence[str],
         time_window: int,
     ):
         self.frames = frames
         self.samples = samples
         self.feature_columns = list(feature_columns)
+        self.aux_feature_columns = list(aux_feature_columns)
         self.time_window = time_window
         self.feature_arrays = {
             ticker: frame.loc[:, self.feature_columns].to_numpy(dtype=np.float32, copy=True)
+            for ticker, frame in frames.items()
+        }
+        self.aux_feature_arrays = {
+            ticker: frame.loc[:, self.aux_feature_columns].to_numpy(dtype=np.float32, copy=True)
             for ticker, frame in frames.items()
         }
         self.label_arrays = {
@@ -39,14 +45,15 @@ class LobWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ticker, row_index = self.samples[index]
         end = row_index + 1
         start = end - self.time_window
         window = self.feature_arrays[ticker][start:end]
         feature = torch.from_numpy(window.copy()).unsqueeze(0)
+        aux_feature = torch.from_numpy(self.aux_feature_arrays[ticker][row_index].copy())
         label = torch.tensor(self.label_arrays[ticker][row_index], dtype=torch.long)
-        return feature, label
+        return feature, aux_feature, label
 
 
 @dataclass
@@ -55,6 +62,7 @@ class DatasetBundle:
     val: LobWindowDataset
     test: LobWindowDataset
     feature_columns: list[str]
+    aux_feature_columns: list[str]
     metadata: dict
     num_classes: int = 3
 
@@ -155,6 +163,88 @@ def _apply_author_lob_normalization(frame: pd.DataFrame, levels: int) -> pd.Data
         frame[bid_size_col] = frame[bid_size_col] / bid_size_max
 
     return frame
+
+
+def _safe_divide(numerator: pd.Series | np.ndarray, denominator: pd.Series | np.ndarray, eps: float = 1e-6) -> pd.Series:
+    numerator_series = pd.Series(numerator, copy=False, dtype=np.float64)
+    denominator_series = pd.Series(denominator, copy=False, dtype=np.float64)
+    return numerator_series / denominator_series.clip(lower=eps)
+
+
+def _compute_auxiliary_features(frame: pd.DataFrame, levels: int, time_window: int) -> list[str]:
+    ask_size_cols = [f"ask_size_{level}" for level in range(1, levels + 1)]
+    bid_size_cols = [f"bid_size_{level}" for level in range(1, levels + 1)]
+    ask_price_cols = [f"ask_price_{level}" for level in range(1, levels + 1)]
+    bid_price_cols = [f"bid_price_{level}" for level in range(1, levels + 1)]
+
+    eps = 1e-6
+    rolling_window = max(int(time_window), 2)
+    mid = frame["mid_price"].clip(lower=eps)
+    spread = frame["spread"]
+
+    ask_depth_5 = frame[ask_size_cols[: min(5, levels)]].sum(axis=1)
+    bid_depth_5 = frame[bid_size_cols[: min(5, levels)]].sum(axis=1)
+    ask_depth_all = frame[ask_size_cols].sum(axis=1)
+    bid_depth_all = frame[bid_size_cols].sum(axis=1)
+
+    mid_log_return = np.log(mid).diff().fillna(0.0)
+    gains = mid_log_return.clip(lower=0.0)
+    losses = (-mid_log_return).clip(lower=0.0)
+
+    signed_size = frame["size"] * frame["direction"]
+    is_limit = frame["event_type"] == 1
+    is_cancel = frame["event_type"].isin([2, 3])
+    is_market = frame["event_type"].isin([4, 5])
+
+    limit_signed = signed_size.where(is_limit, 0.0)
+    cancel_signed = signed_size.where(is_cancel, 0.0)
+    market_signed = signed_size.where(is_market, 0.0)
+
+    micro_price = (
+        frame["ask_price_1"] * frame["bid_size_1"] + frame["bid_price_1"] * frame["ask_size_1"]
+    ) / (frame["ask_size_1"] + frame["bid_size_1"] + eps)
+    weighted_ask = np.average(frame[ask_price_cols].to_numpy(), axis=1, weights=frame[ask_size_cols].to_numpy() + eps)
+    weighted_bid = np.average(frame[bid_price_cols].to_numpy(), axis=1, weights=frame[bid_size_cols].to_numpy() + eps)
+
+    feature_map = {
+        "rel_spread": _safe_divide(spread, mid, eps),
+        "top_depth_imbalance": _safe_divide(frame["bid_size_1"] - frame["ask_size_1"], frame["bid_size_1"] + frame["ask_size_1"], eps),
+        "depth_imbalance_5": _safe_divide(bid_depth_5 - ask_depth_5, bid_depth_5 + ask_depth_5, eps),
+        "depth_imbalance_10": _safe_divide(bid_depth_all - ask_depth_all, bid_depth_all + ask_depth_all, eps),
+        "microprice_bias": _safe_divide(micro_price - mid, mid, eps),
+        "depth_slope_bias": _safe_divide((weighted_ask - mid) - (mid - weighted_bid), mid, eps),
+        "realized_volatility": mid_log_return.pow(2).rolling(rolling_window, min_periods=2).sum().pow(0.5).fillna(0.0),
+        "rsi_like": _safe_divide(
+            gains.rolling(rolling_window, min_periods=2).mean(),
+            gains.rolling(rolling_window, min_periods=2).mean() + losses.rolling(rolling_window, min_periods=2).mean(),
+            eps,
+        ).fillna(0.5),
+        "signed_flow_imbalance": _safe_divide(
+            signed_size.rolling(rolling_window, min_periods=2).sum(),
+            signed_size.abs().rolling(rolling_window, min_periods=2).sum(),
+            eps,
+        ).fillna(0.0),
+        "limit_flow_imbalance": _safe_divide(
+            limit_signed.rolling(rolling_window, min_periods=2).sum(),
+            limit_signed.abs().rolling(rolling_window, min_periods=2).sum(),
+            eps,
+        ).fillna(0.0),
+        "cancel_flow_imbalance": _safe_divide(
+            cancel_signed.rolling(rolling_window, min_periods=2).sum(),
+            cancel_signed.abs().rolling(rolling_window, min_periods=2).sum(),
+            eps,
+        ).fillna(0.0),
+        "market_flow_imbalance": _safe_divide(
+            market_signed.rolling(rolling_window, min_periods=2).sum(),
+            market_signed.abs().rolling(rolling_window, min_periods=2).sum(),
+            eps,
+        ).fillna(0.0),
+    }
+
+    for column, values in feature_map.items():
+        frame[column] = pd.Series(values, index=frame.index, dtype=np.float64).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    return list(feature_map.keys())
 
 
 def load_lobster_frame(
@@ -265,7 +355,7 @@ def load_and_process_day(
     label_threshold: float = 1e-5,
     split_train: float = 0.6,
     split_val: float = 0.2,
-) -> tuple[pd.DataFrame, list[str], dict]:
+) -> tuple[pd.DataFrame, list[str], list[str], dict]:
     frame = load_lobster_frame(
         ticker=ticker,
         trading_date=trading_date,
@@ -279,6 +369,7 @@ def load_and_process_day(
         split_val=split_val,
     )
     feature_columns = _orderbook_columns(levels)
+    aux_feature_columns = _compute_auxiliary_features(frame, levels=levels, time_window=time_window)
     metadata = {
         "ticker": ticker,
         "trading_date": trading_date,
@@ -287,11 +378,12 @@ def load_and_process_day(
         "horizon": horizon,
         "label_threshold": label_threshold,
         "time_window": time_window,
+        "aux_feature_columns": aux_feature_columns,
         "split_train": split_train,
         "split_val": split_val,
         "split_test": 1.0 - split_train - split_val,
     }
-    return frame, feature_columns, metadata
+    return frame, feature_columns, aux_feature_columns, metadata
 
 
 def create_datasets(
@@ -313,9 +405,10 @@ def create_datasets(
     test_samples: list[tuple[str, int]] = []
     all_metadata: Dict[str, dict] = {}
     feature_columns = _orderbook_columns(levels)
+    aux_feature_columns: list[str] | None = None
 
     for ticker in tickers:
-        frame, _, metadata = load_and_process_day(
+        frame, _, current_aux_feature_columns, metadata = load_and_process_day(
             ticker=ticker,
             trading_date=trading_date,
             data_root=data_root,
@@ -328,11 +421,26 @@ def create_datasets(
             split_train=split_train,
             split_val=split_val,
         )
+        if aux_feature_columns is None:
+            aux_feature_columns = current_aux_feature_columns
+        elif aux_feature_columns != current_aux_feature_columns:
+            raise ValueError("Auxiliary feature columns must match across tickers")
         frames[ticker] = frame
         all_metadata[ticker] = metadata
         train_samples.extend(_collect_split_samples(frame, ticker, "train", time_window))
         val_samples.extend(_collect_split_samples(frame, ticker, "val", time_window))
         test_samples.extend(_collect_split_samples(frame, ticker, "test", time_window))
+
+    if aux_feature_columns is None:
+        aux_feature_columns = []
+
+    train_aux_frames = [frame.loc[frame["split_id"] == SPLIT_TO_ID["train"], aux_feature_columns] for frame in frames.values()]
+    train_aux = pd.concat(train_aux_frames, axis=0, ignore_index=True)
+    aux_mean = train_aux.mean(axis=0)
+    aux_std = train_aux.std(axis=0).replace(0.0, 1.0).fillna(1.0)
+
+    for frame in frames.values():
+        frame.loc[:, aux_feature_columns] = ((frame.loc[:, aux_feature_columns] - aux_mean) / aux_std).astype(np.float32)
 
     metadata = {
         "tickers": list(tickers),
@@ -341,15 +449,21 @@ def create_datasets(
         "horizon": horizon,
         "label_threshold": label_threshold,
         "time_window": time_window,
+        "aux_feature_columns": aux_feature_columns,
+        "aux_feature_stats": {
+            "mean": {column: float(aux_mean[column]) for column in aux_feature_columns},
+            "std": {column: float(aux_std[column]) for column in aux_feature_columns},
+        },
         "split_train": split_train,
         "split_val": split_val,
         "split_test": 1.0 - split_train - split_val,
         "per_ticker": all_metadata,
     }
     return DatasetBundle(
-        train=LobWindowDataset(frames, train_samples, feature_columns, time_window),
-        val=LobWindowDataset(frames, val_samples, feature_columns, time_window),
-        test=LobWindowDataset(frames, test_samples, feature_columns, time_window),
+        train=LobWindowDataset(frames, train_samples, feature_columns, aux_feature_columns, time_window),
+        val=LobWindowDataset(frames, val_samples, feature_columns, aux_feature_columns, time_window),
+        test=LobWindowDataset(frames, test_samples, feature_columns, aux_feature_columns, time_window),
         feature_columns=feature_columns,
+        aux_feature_columns=aux_feature_columns,
         metadata=metadata,
     )

@@ -135,15 +135,45 @@ class AttnLOBEncoder(nn.Module):
 
 
 class AttnLOBClassifier(nn.Module):
-    def __init__(self, time_window: int = 50, embedding_dim: int = 64, num_classes: int = 3):
+    def __init__(
+        self,
+        time_window: int = 50,
+        embedding_dim: int = 64,
+        num_classes: int = 3,
+        aux_feature_dim: int = 0,
+    ):
         super().__init__()
         self.encoder = AttnLOBEncoder(time_window=time_window, embedding_dim=embedding_dim)
-        self.classifier = nn.Linear(embedding_dim, num_classes)
+        self.aux_feature_dim = aux_feature_dim
+        if aux_feature_dim > 0:
+            self.aux_projection = nn.Sequential(
+                nn.LayerNorm(aux_feature_dim),
+                nn.Linear(aux_feature_dim, embedding_dim),
+                nn.LeakyReLU(negative_slope=0.01),
+            )
+            classifier_input_dim = embedding_dim * 2
+        else:
+            self.aux_projection = None
+            classifier_input_dim = embedding_dim
+        self.classifier = nn.Linear(classifier_input_dim, num_classes)
 
-    def forward(self, inputs: torch.Tensor, return_attention: bool = False):
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        aux_features: torch.Tensor | None = None,
+        return_attention: bool = False,
+    ):
         if return_attention:
             embedding, attention_weights = self.encoder(inputs, return_attention=True)
-            logits = self.classifier(embedding)
+            logits = self.classifier(self._merge_features(embedding, aux_features))
             return logits, attention_weights
         embedding = self.encoder(inputs)
-        return self.classifier(embedding)
+        return self.classifier(self._merge_features(embedding, aux_features))
+
+    def _merge_features(self, embedding: torch.Tensor, aux_features: torch.Tensor | None) -> torch.Tensor:
+        if self.aux_projection is None:
+            return embedding
+        if aux_features is None:
+            raise ValueError("aux_features must be provided when aux_feature_dim > 0")
+        aux_embedding = self.aux_projection(aux_features.to(dtype=embedding.dtype))
+        return torch.cat([embedding, aux_embedding], dim=1)
