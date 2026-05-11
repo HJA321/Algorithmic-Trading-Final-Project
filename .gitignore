@@ -12,6 +12,7 @@ __pycache__/
 .cache/
 *.egg-info/
 __MACOSX/
+Materials/
 
 # LaTeX build artifacts
 *.aux
