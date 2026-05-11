@@ -1,14 +1,17 @@
-# Python 3.10+ recommended.
-# Use an isolated virtual environment when possible.
-# For GPU training, install a CUDA-compatible PyTorch wheel from https://pytorch.org/get-started/locally/
+# Python 3.10+ is recommended.
+# For GPU training, install the CUDA-matched PyTorch wheel first if needed:
+# https://pytorch.org/get-started/locally/
 
-# NumPy 2.x is not compatible with the system PyTorch/SciPy stack currently present
-# in this repo's target environment, so keep NumPy on the latest 1.24 line.
-numpy>=1.24,<1.25
-pandas>=2.0,<3
-scipy>=1.10,<1.13
-networkx>=3.2,<4
-torch>=2.2,<3
-tqdm>=4.66,<5
-gymnasium>=0.29,<1
-stable-baselines3>=2.3,<3
+tqdm>=4.66,<5.0
+numpy>=1.24,<2.0
+pandas>=2.0,<3.0
+tables>=3.8,<4.0
+
+# Install the CUDA 12.1 PyTorch wheel on this server. The NVIDIA driver here
+# reports CUDA driver API 12.2, so newer CUDA 13 PyTorch wheels cannot initialize.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+
+# Reinforcement-learning stage.
+gymnasium>=0.29,<1.0
+stable-baselines3>=2.3,<3.0

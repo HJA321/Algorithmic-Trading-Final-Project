@@ -1,8 +1,36 @@
 .DS_Store
 .venv/
+.env
+.env.*
+.codex
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+*.egg-info/
+__MACOSX/
 
+# Local datasets and uploaded archives
+l2_zip/
+l2_zip.zip
+Our-Code/data/
+
+# Local exploratory/submission-adjacent files not needed for code submission
+inspect_l2_zip_data.ipynb
+inspect_processed_sz_l2_data.ipynb
+Algo Final Project.pptx
+Market Making with Deep Reinforcement Learning from Limit Order Books.pdf
+
+# Generated LOBSTER datasets
 lobster_attnlob_us_repro/data/
+lobster_attnlob_us_repro/data/lobster_raw/
+lobster_attnlob_us_repro/data/lobster_processed/
+
+# Training artifacts
 Our-Code/checkpoints/
+Our-Code/experiment_results/
+Our-Code/runs/
+Our-Code/wandb/

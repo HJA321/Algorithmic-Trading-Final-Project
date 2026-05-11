@@ -61,57 +61,70 @@ class MaxPool2dSame(nn.Module):
 
 
 class AttnLOBEncoder(nn.Module):
-    def __init__(self, time_window: int = 50, embedding_dim: int = 64, num_heads: int = 10, head_dim: int = 16):
+    def __init__(
+        self,
+        time_window: int = 50,
+        embedding_dim: int = 64,
+        conv_channels: int = 32,
+        inception_channels: int = 64,
+        num_heads: int = 10,
+        head_dim: int = 16,
+    ):
         super().__init__()
         self.time_window = time_window
         self.embedding_dim = embedding_dim
+        self.conv_channels = conv_channels
+        self.inception_channels = inception_channels
+        self.num_heads = num_heads
+        self.head_dim = head_dim
         attn_dim = num_heads * head_dim
+        inception_dim = 3 * inception_channels
 
         self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=(1, 2), stride=(1, 2)),
+            nn.Conv2d(1, conv_channels, kernel_size=(1, 2), stride=(1, 2)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            Conv2dSame(conv_channels, conv_channels, kernel_size=(4, 1)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            Conv2dSame(conv_channels, conv_channels, kernel_size=(4, 1)),
             nn.LeakyReLU(negative_slope=0.01),
-            nn.Conv2d(32, 32, kernel_size=(1, 5), stride=(1, 5)),
+            nn.Conv2d(conv_channels, conv_channels, kernel_size=(1, 5), stride=(1, 5)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            Conv2dSame(conv_channels, conv_channels, kernel_size=(4, 1)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            Conv2dSame(conv_channels, conv_channels, kernel_size=(4, 1)),
             nn.LeakyReLU(negative_slope=0.01),
-            nn.Conv2d(32, 32, kernel_size=(1, 4)),
+            nn.Conv2d(conv_channels, conv_channels, kernel_size=(1, 4)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            Conv2dSame(conv_channels, conv_channels, kernel_size=(4, 1)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(32, 32, kernel_size=(4, 1)),
+            Conv2dSame(conv_channels, conv_channels, kernel_size=(4, 1)),
             nn.LeakyReLU(negative_slope=0.01),
         )
 
         self.inception_branch_1 = nn.Sequential(
-            Conv2dSame(32, 64, kernel_size=(1, 1)),
+            Conv2dSame(conv_channels, inception_channels, kernel_size=(1, 1)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(64, 64, kernel_size=(3, 1)),
+            Conv2dSame(inception_channels, inception_channels, kernel_size=(3, 1)),
             nn.LeakyReLU(negative_slope=0.01),
         )
         self.inception_branch_2 = nn.Sequential(
-            Conv2dSame(32, 64, kernel_size=(1, 1)),
+            Conv2dSame(conv_channels, inception_channels, kernel_size=(1, 1)),
             nn.LeakyReLU(negative_slope=0.01),
-            Conv2dSame(64, 64, kernel_size=(5, 1)),
+            Conv2dSame(inception_channels, inception_channels, kernel_size=(5, 1)),
             nn.LeakyReLU(negative_slope=0.01),
         )
         self.inception_branch_3 = nn.Sequential(
             MaxPool2dSame(kernel_size=(3, 1), stride=(1, 1)),
-            Conv2dSame(32, 64, kernel_size=(1, 1)),
+            Conv2dSame(conv_channels, inception_channels, kernel_size=(1, 1)),
             nn.LeakyReLU(negative_slope=0.01),
         )
 
-        self.query_projection = nn.Linear(192, attn_dim)
+        self.query_projection = nn.Linear(inception_dim, attn_dim)
         self.attention = nn.MultiheadAttention(
             embed_dim=attn_dim,
             num_heads=num_heads,
-            kdim=192,
-            vdim=192,
+            kdim=inception_dim,
+            vdim=inception_dim,
             batch_first=True,
         )
         self.output_projection = nn.Linear(attn_dim, embedding_dim)
@@ -139,11 +152,22 @@ class AttnLOBClassifier(nn.Module):
         self,
         time_window: int = 50,
         embedding_dim: int = 64,
+        conv_channels: int = 32,
+        inception_channels: int = 64,
+        num_heads: int = 10,
+        head_dim: int = 16,
         num_classes: int = 3,
         aux_feature_dim: int = 0,
     ):
         super().__init__()
-        self.encoder = AttnLOBEncoder(time_window=time_window, embedding_dim=embedding_dim)
+        self.encoder = AttnLOBEncoder(
+            time_window=time_window,
+            embedding_dim=embedding_dim,
+            conv_channels=conv_channels,
+            inception_channels=inception_channels,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
         self.aux_feature_dim = aux_feature_dim
         if aux_feature_dim > 0:
             self.aux_projection = nn.Sequential(

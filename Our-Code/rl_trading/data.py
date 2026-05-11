@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from attn_lob_pytorch.data import normalize_lob_window
+from attn_lob_pytorch.data import compute_lob_size_max, normalize_lob_window
 
 ORDERBOOK_COLUMNS = [
     item
@@ -28,6 +28,7 @@ class PreparedMarketData:
     frame: pd.DataFrame
     market_state_mean: np.ndarray
     market_state_std: np.ndarray
+    lob_size_max: np.ndarray
 
 
 def default_processed_root() -> Path:
@@ -45,11 +46,13 @@ def load_prepared_market_data(ticker: str, processed_root: str | Path | None = N
     market_values = frame.loc[train_mask, MARKET_STATE_COLUMNS]
     market_state_mean = market_values.mean(axis=0).to_numpy(dtype=np.float32)
     market_state_std = market_values.std(axis=0).replace(0.0, 1.0).fillna(1.0).to_numpy(dtype=np.float32)
+    lob_size_max = compute_lob_size_max(frame, levels=10, mask=train_mask)
     return PreparedMarketData(
         ticker=ticker,
         frame=frame,
         market_state_mean=market_state_mean,
         market_state_std=market_state_std,
+        lob_size_max=lob_size_max,
     )
 
 
@@ -66,9 +69,14 @@ def normalized_market_state(frame: pd.DataFrame, row_index: int, mean: np.ndarra
     return ((market_state - mean) / std).astype(np.float32)
 
 
-def normalized_lob_observation(frame: pd.DataFrame, row_index: int, time_window: int) -> np.ndarray:
+def normalized_lob_observation(
+    frame: pd.DataFrame,
+    row_index: int,
+    time_window: int,
+    size_max: np.ndarray,
+) -> np.ndarray:
     start = row_index - time_window
     if start < 0:
         raise ValueError("Not enough history to construct lob observation")
     window = frame.iloc[start:row_index][ORDERBOOK_COLUMNS].to_numpy(dtype=np.float32, copy=True)
-    return normalize_lob_window(window)
+    return normalize_lob_window(window, size_max=size_max)

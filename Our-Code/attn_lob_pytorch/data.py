@@ -22,12 +22,14 @@ class LobWindowDataset(Dataset):
         samples: list[tuple[str, int]],
         feature_columns: Sequence[str],
         aux_feature_columns: Sequence[str],
+        lob_size_max: Dict[str, np.ndarray],
         time_window: int,
     ):
         self.frames = frames
         self.samples = samples
         self.feature_columns = list(feature_columns)
         self.aux_feature_columns = list(aux_feature_columns)
+        self.lob_size_max = lob_size_max
         self.time_window = time_window
         self.feature_arrays = {
             ticker: frame.loc[:, self.feature_columns].to_numpy(dtype=np.float32, copy=True)
@@ -50,7 +52,8 @@ class LobWindowDataset(Dataset):
         end = row_index + 1
         start = end - self.time_window
         window = self.feature_arrays[ticker][start:end]
-        feature = torch.from_numpy(window.copy()).unsqueeze(0)
+        window = normalize_lob_window(window, size_max=self.lob_size_max[ticker])
+        feature = torch.from_numpy(window).unsqueeze(0)
         aux_feature = torch.from_numpy(self.aux_feature_arrays[ticker][row_index].copy())
         label = torch.tensor(self.label_arrays[ticker][row_index], dtype=torch.long)
         return feature, aux_feature, label
@@ -143,26 +146,6 @@ def _compute_labels(mid_price: np.ndarray, horizon_k: int, threshold: float = 1e
     labels[mid_mask] = 1
     labels[up_mask] = 2
     return labels
-
-
-def _apply_author_lob_normalization(frame: pd.DataFrame, levels: int) -> pd.DataFrame:
-    mid_price = frame["mid_price"].to_numpy(dtype=np.float64)
-
-    for level in range(1, levels + 1):
-        ask_price_col = f"ask_price_{level}"
-        bid_price_col = f"bid_price_{level}"
-        ask_size_col = f"ask_size_{level}"
-        bid_size_col = f"bid_size_{level}"
-
-        frame[ask_price_col] = frame[ask_price_col] / np.clip(mid_price, 1e-7, None) - 1.0
-        frame[bid_price_col] = frame[bid_price_col] / np.clip(mid_price, 1e-7, None) - 1.0
-
-        ask_size_max = max(float(frame[ask_size_col].max()), 1.0)
-        bid_size_max = max(float(frame[bid_size_col].max()), 1.0)
-        frame[ask_size_col] = frame[ask_size_col] / ask_size_max
-        frame[bid_size_col] = frame[bid_size_col] / bid_size_max
-
-    return frame
 
 
 def _safe_divide(numerator: pd.Series | np.ndarray, denominator: pd.Series | np.ndarray, eps: float = 1e-6) -> pd.Series:
@@ -320,12 +303,49 @@ def load_lobster_frame(
     frame["time_hours"] = frame["time"] / 3600.0
     frame["ticker"] = ticker
     frame["trading_date"] = trading_date
-    frame = _apply_author_lob_normalization(frame, levels=levels)
     return frame
 
 
-def normalize_lob_window(window: np.ndarray) -> np.ndarray:
-    return np.asarray(window, dtype=np.float32).copy()
+def lob_size_columns(levels: int = 10) -> list[str]:
+    columns: list[str] = []
+    for level in range(1, levels + 1):
+        columns.extend([f"ask_size_{level}", f"bid_size_{level}"])
+    return columns
+
+
+def compute_lob_size_max(frame: pd.DataFrame, levels: int = 10, mask: pd.Series | np.ndarray | None = None) -> np.ndarray:
+    """Return max-volume denominators in the same order as normalize_lob_window expects."""
+    size_columns = lob_size_columns(levels)
+    source = frame.loc[mask, size_columns] if mask is not None else frame.loc[:, size_columns]
+    size_max = source.max(axis=0).replace(0.0, 1.0).fillna(1.0).to_numpy(dtype=np.float32)
+    return np.maximum(size_max, 1.0)
+
+
+def normalize_lob_window(window: np.ndarray, size_max: np.ndarray | None = None) -> np.ndarray:
+    """Normalize one raw LOB window with the paper author's price/volume convention.
+
+    Input column order is ask_price, ask_size, bid_price, bid_size for levels 1..N.
+    Prices become relative to the row mid-price, and sizes use max-normalization.
+    Passing train-set ``size_max`` keeps pretraining and RL observations on the
+    same scale while avoiding validation/test leakage.
+    """
+    window = np.asarray(window, dtype=np.float32).copy()
+    if window.ndim != 2 or window.shape[1] % 4 != 0:
+        raise ValueError("LOB window must have shape (time, 4 * levels)")
+
+    price_idx = [idx for idx in range(window.shape[1]) if idx % 4 in (0, 2)]
+    size_idx = [idx for idx in range(window.shape[1]) if idx % 4 in (1, 3)]
+    mid = ((window[:, 0] + window[:, 2]) / 2.0).reshape(-1, 1)
+
+    window[:, price_idx] = window[:, price_idx] / np.clip(mid, 1e-7, None) - 1.0
+    if size_max is None:
+        denominator = np.max(np.abs(window[:, size_idx]), axis=0, keepdims=True)
+    else:
+        denominator = np.asarray(size_max, dtype=np.float32).reshape(1, -1)
+        if denominator.shape[1] != len(size_idx):
+            raise ValueError("size_max length must match the number of LOB size columns")
+    window[:, size_idx] = window[:, size_idx] / np.clip(denominator, 1.0, None)
+    return np.nan_to_num(window, copy=False).astype(np.float32)
 
 
 def normalize_lob_batch(batch: torch.Tensor) -> torch.Tensor:
@@ -355,6 +375,7 @@ def load_and_process_day(
     label_threshold: float = 1e-5,
     split_train: float = 0.6,
     split_val: float = 0.2,
+    include_aux_features: bool = False,
 ) -> tuple[pd.DataFrame, list[str], list[str], dict]:
     frame = load_lobster_frame(
         ticker=ticker,
@@ -369,7 +390,11 @@ def load_and_process_day(
         split_val=split_val,
     )
     feature_columns = _orderbook_columns(levels)
-    aux_feature_columns = _compute_auxiliary_features(frame, levels=levels, time_window=time_window)
+    aux_feature_columns = (
+        _compute_auxiliary_features(frame, levels=levels, time_window=time_window)
+        if include_aux_features
+        else []
+    )
     metadata = {
         "ticker": ticker,
         "trading_date": trading_date,
@@ -379,6 +404,7 @@ def load_and_process_day(
         "label_threshold": label_threshold,
         "time_window": time_window,
         "aux_feature_columns": aux_feature_columns,
+        "include_aux_features": include_aux_features,
         "split_train": split_train,
         "split_val": split_val,
         "split_test": 1.0 - split_train - split_val,
@@ -398,6 +424,7 @@ def create_datasets(
     label_threshold: float = 1e-5,
     split_train: float = 0.6,
     split_val: float = 0.2,
+    include_aux_features: bool = False,
 ) -> DatasetBundle:
     frames: Dict[str, pd.DataFrame] = {}
     train_samples: list[tuple[str, int]] = []
@@ -420,6 +447,7 @@ def create_datasets(
             label_threshold=label_threshold,
             split_train=split_train,
             split_val=split_val,
+            include_aux_features=include_aux_features,
         )
         if aux_feature_columns is None:
             aux_feature_columns = current_aux_feature_columns
@@ -434,13 +462,25 @@ def create_datasets(
     if aux_feature_columns is None:
         aux_feature_columns = []
 
-    train_aux_frames = [frame.loc[frame["split_id"] == SPLIT_TO_ID["train"], aux_feature_columns] for frame in frames.values()]
-    train_aux = pd.concat(train_aux_frames, axis=0, ignore_index=True)
-    aux_mean = train_aux.mean(axis=0)
-    aux_std = train_aux.std(axis=0).replace(0.0, 1.0).fillna(1.0)
+    lob_size_max = {
+        ticker: compute_lob_size_max(frame, levels=levels, mask=frame["split_id"] == SPLIT_TO_ID["train"])
+        for ticker, frame in frames.items()
+    }
 
-    for frame in frames.values():
-        frame.loc[:, aux_feature_columns] = ((frame.loc[:, aux_feature_columns] - aux_mean) / aux_std).astype(np.float32)
+    if aux_feature_columns:
+        train_aux_frames = [frame.loc[frame["split_id"] == SPLIT_TO_ID["train"], aux_feature_columns] for frame in frames.values()]
+        train_aux = pd.concat(train_aux_frames, axis=0, ignore_index=True)
+        aux_mean = train_aux.mean(axis=0)
+        aux_std = train_aux.std(axis=0).replace(0.0, 1.0).fillna(1.0)
+
+        for frame in frames.values():
+            frame.loc[:, aux_feature_columns] = ((frame.loc[:, aux_feature_columns] - aux_mean) / aux_std).astype(np.float32)
+        aux_feature_stats = {
+            "mean": {column: float(aux_mean[column]) for column in aux_feature_columns},
+            "std": {column: float(aux_std[column]) for column in aux_feature_columns},
+        }
+    else:
+        aux_feature_stats = {"mean": {}, "std": {}}
 
     metadata = {
         "tickers": list(tickers),
@@ -450,9 +490,12 @@ def create_datasets(
         "label_threshold": label_threshold,
         "time_window": time_window,
         "aux_feature_columns": aux_feature_columns,
-        "aux_feature_stats": {
-            "mean": {column: float(aux_mean[column]) for column in aux_feature_columns},
-            "std": {column: float(aux_std[column]) for column in aux_feature_columns},
+        "include_aux_features": include_aux_features,
+        "aux_feature_stats": aux_feature_stats,
+        "lob_normalization": {
+            "price": "price / row_mid_price - 1",
+            "size": "size / train_split_max_size_per_column",
+            "size_max": {ticker: values.tolist() for ticker, values in lob_size_max.items()},
         },
         "split_train": split_train,
         "split_val": split_val,
@@ -460,9 +503,116 @@ def create_datasets(
         "per_ticker": all_metadata,
     }
     return DatasetBundle(
-        train=LobWindowDataset(frames, train_samples, feature_columns, aux_feature_columns, time_window),
-        val=LobWindowDataset(frames, val_samples, feature_columns, aux_feature_columns, time_window),
-        test=LobWindowDataset(frames, test_samples, feature_columns, aux_feature_columns, time_window),
+        train=LobWindowDataset(frames, train_samples, feature_columns, aux_feature_columns, lob_size_max, time_window),
+        val=LobWindowDataset(frames, val_samples, feature_columns, aux_feature_columns, lob_size_max, time_window),
+        test=LobWindowDataset(frames, test_samples, feature_columns, aux_feature_columns, lob_size_max, time_window),
+        feature_columns=feature_columns,
+        aux_feature_columns=aux_feature_columns,
+        metadata=metadata,
+    )
+
+
+def load_processed_frames(
+    tickers: Sequence[str],
+    processed_root: str | Path,
+) -> Dict[str, pd.DataFrame]:
+    root = Path(processed_root)
+    frames: Dict[str, pd.DataFrame] = {}
+    for ticker in tickers:
+        frame_path = root / ticker / "events.pkl.gz"
+        if not frame_path.exists():
+            raise FileNotFoundError(f"Processed frame not found for {ticker}: {frame_path}")
+        frame = pd.read_pickle(frame_path, compression="gzip").reset_index(drop=True)
+        required_columns = set(_orderbook_columns(10)) | {"label", "split_id"}
+        missing = sorted(required_columns - set(frame.columns))
+        if missing:
+            raise ValueError(f"Processed frame {frame_path} is missing required columns: {missing}")
+        frames[ticker] = frame
+    return frames
+
+
+def _normalize_processed_aux_features(
+    frames: Dict[str, pd.DataFrame],
+    aux_feature_columns: list[str],
+) -> dict:
+    if not aux_feature_columns:
+        return {"mean": {}, "std": {}}
+
+    train_aux_frames = [
+        frame.loc[frame["split_id"] == SPLIT_TO_ID["train"], aux_feature_columns]
+        for frame in frames.values()
+    ]
+    train_aux = pd.concat(train_aux_frames, axis=0, ignore_index=True)
+    aux_mean = train_aux.mean(axis=0)
+    aux_std = train_aux.std(axis=0).replace(0.0, 1.0).fillna(1.0)
+    for frame in frames.values():
+        frame.loc[:, aux_feature_columns] = ((frame.loc[:, aux_feature_columns] - aux_mean) / aux_std).astype(np.float32)
+    return {
+        "mean": {column: float(aux_mean[column]) for column in aux_feature_columns},
+        "std": {column: float(aux_std[column]) for column in aux_feature_columns},
+    }
+
+
+def create_datasets_from_processed_root(
+    tickers: Sequence[str],
+    processed_root: str | Path,
+    levels: int = 10,
+    time_window: int = 50,
+    include_aux_features: bool = False,
+) -> DatasetBundle:
+    frames = load_processed_frames(tickers, processed_root)
+    feature_columns = _orderbook_columns(levels)
+    missing_by_ticker = {
+        ticker: sorted(set(feature_columns) - set(frame.columns))
+        for ticker, frame in frames.items()
+        if sorted(set(feature_columns) - set(frame.columns))
+    }
+    if missing_by_ticker:
+        raise ValueError(f"Processed frames are missing orderbook columns: {missing_by_ticker}")
+
+    aux_feature_columns = (
+        [column for column in frames[next(iter(frames))].columns if column.startswith("market_state_")]
+        if include_aux_features and frames
+        else []
+    )
+    aux_feature_stats = _normalize_processed_aux_features(frames, aux_feature_columns)
+
+    train_samples: list[tuple[str, int]] = []
+    val_samples: list[tuple[str, int]] = []
+    test_samples: list[tuple[str, int]] = []
+    for ticker, frame in frames.items():
+        train_samples.extend(_collect_split_samples(frame, ticker, "train", time_window))
+        val_samples.extend(_collect_split_samples(frame, ticker, "val", time_window))
+        test_samples.extend(_collect_split_samples(frame, ticker, "test", time_window))
+
+    lob_size_max = {
+        ticker: compute_lob_size_max(frame, levels=levels, mask=frame["split_id"] == SPLIT_TO_ID["train"])
+        for ticker, frame in frames.items()
+    }
+    metadata = {
+        "source": "processed_root",
+        "processed_root": str(processed_root),
+        "tickers": list(tickers),
+        "levels": levels,
+        "time_window": time_window,
+        "aux_feature_columns": aux_feature_columns,
+        "include_aux_features": include_aux_features,
+        "aux_feature_stats": aux_feature_stats,
+        "lob_normalization": {
+            "price": "price / row_mid_price - 1",
+            "size": "size / train_split_max_size_per_column",
+            "size_max": {ticker: values.tolist() for ticker, values in lob_size_max.items()},
+        },
+        "split_samples": {
+            "train": len(train_samples),
+            "val": len(val_samples),
+            "test": len(test_samples),
+        },
+    }
+    return DatasetBundle(
+        train=LobWindowDataset(frames, train_samples, feature_columns, aux_feature_columns, lob_size_max, time_window),
+        val=LobWindowDataset(frames, val_samples, feature_columns, aux_feature_columns, lob_size_max, time_window),
+        test=LobWindowDataset(frames, test_samples, feature_columns, aux_feature_columns, lob_size_max, time_window),
         feature_columns=feature_columns,
         aux_feature_columns=aux_feature_columns,
         metadata=metadata,
