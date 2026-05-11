@@ -180,12 +180,15 @@ cd Our-Code
 
 ## Latency And Order-Loss Evaluation
 
+The main reported experiments set transaction costs and market impact to zero because the strategy is modeled as small-order high-frequency market making, where individual quotes are assumed to be small relative to displayed depth. This keeps the comparison focused on policy behavior under a shared execution model; cost parameters remain available for sensitivity tests.
+
 The paper-style `--latency` parameter is an event delay on the information used by the policy: the agent observes and quotes from `t - latency`. For stricter backtests, the RL and baseline environments also support:
 
 - `--order-latency-events`: raw event-count delay before the submitted quote can reach the simulated exchange
 - `--order-latency-ms`: wall-clock delay in milliseconds, converted with the processed `time` column
 - `--inference-latency-ms`: simulated model calculation delay added to order arrival
 - `--order-loss-probability`: independent probability that each submitted bid/ask quote is not accepted
+- `--transaction-cost-bps` and `--fixed-fee-per-trade`: optional cost controls for robustness checks
 
 Evaluate saved SZ10 models and baselines under a default stress-test grid:
 
