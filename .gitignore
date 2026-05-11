@@ -13,6 +13,16 @@ __pycache__/
 *.egg-info/
 __MACOSX/
 
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+
 # Local datasets and uploaded archives
 l2_zip/
 l2_zip.zip
